@@ -1,7 +1,9 @@
+import json
 import logging
-from datetime import timedelta
+import os
+from datetime import datetime, timedelta, timezone
 from decimal import getcontext, Decimal, ROUND_CEILING
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from app.domain.events import MarketBookUpdated, ArbitrageOpportunityFound, ExecuteTrade, TradeAttemptCompleted
 from app.domain.models.opportunity import ArbitrageOpportunity
@@ -16,6 +18,29 @@ getcontext().prec = 6
 logger = logging.getLogger(__name__)
 PROFITABILITY_BUFFER = Decimal("0.01")
 STALENESS_THRESHOLD = timedelta(seconds=5)
+
+# Observation-only JSONL sink. Active when OBSERVATION_LOG_PATH env var is set.
+# Writes one row per arbitrage price check with full field set + decision/reason.
+# Strategy thresholds and decision logic are NOT affected by this flag.
+_OBSERVATION_LOG_PATH = os.environ.get("OBSERVATION_LOG_PATH")
+
+
+def _jsonable(v: Any) -> Any:
+    if v is None:
+        return None
+    if isinstance(v, Decimal):
+        return str(v)
+    return v
+
+
+def _write_observation(row: Dict[str, Any]) -> None:
+    if not _OBSERVATION_LOG_PATH:
+        return
+    try:
+        with open(_OBSERVATION_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps({k: _jsonable(v) for k, v in row.items()}) + "\n")
+    except Exception:
+        logger.exception("Failed to write observation row")
 
 # Dependencies are stored at the module level and injected once at startup.
 _market_manager: MarketManager
@@ -128,6 +153,8 @@ def _check_for_buy_both_arb(market_state: MarketState) -> Optional[ArbitrageOppo
     kalshi_yes_bid_size = kalshi_yes_tob[0][1] if kalshi_yes_tob[0] else Decimal("0")
     poly_yes_ask_size = poly_yes_tob[1][1] if poly_yes_tob[1] else Decimal("0")
     poly_no_ask_size = poly_no_tob[1][1] if poly_no_tob[1] else Decimal("0")
+    # Kalshi has only a YES book — the implied "NO ask" size is the YES bid size.
+    kalshi_no_ask_size = kalshi_yes_bid_size
 
     # +++ ADDED FOR DIAGNOSTICS +++
     logger.info(
@@ -142,8 +169,23 @@ def _check_for_buy_both_arb(market_state: MarketState) -> Optional[ArbitrageOppo
     )
     # +++ END DIAGNOSTICS +++
 
+    # Track decision per opportunity for the structured observation log.
+    # Strategy logic below is unchanged — these only carry "why".
+    opp1_decision = "no_trade"
+    opp1_reason: Optional[str] = None
+    opp2_decision = "no_trade"
+    opp2_reason: Optional[str] = None
+    opp1_sum: Optional[Decimal] = None
+    opp2_sum: Optional[Decimal] = None
+    opp1_fee_buffer: Optional[Decimal] = None
+    opp2_fee_buffer: Optional[Decimal] = None
+    returned_opportunity: Optional[ArbitrageOpportunity] = None
+
     # --- Opportunity 1: Buy YES on Kalshi, Buy NO on Polymarket ---
-    if kalshi_yes_ask_price is not None and poly_no_ask_price is not None:
+    if kalshi_yes_ask_price is None or poly_no_ask_price is None:
+        opp1_reason = "missing_price"
+    else:
+        opp1_sum = kalshi_yes_ask_price + poly_no_ask_price
         is_stale = False
         if kalshi_outcomes and poly_outcomes:
             kalshi_book = kalshi_outcomes.get_book("YES")
@@ -152,43 +194,127 @@ def _check_for_buy_both_arb(market_state: MarketState) -> Optional[ArbitrageOppo
                 logger.debug("Skipping opportunity 1 check for %s due to stale books.", market_id)
                 is_stale = True
 
-        if not is_stale:
-            cost1 = kalshi_yes_ask_price + poly_no_ask_price
+        if is_stale:
+            opp1_reason = "stale_books"
+        else:
+            cost1 = opp1_sum
             trade_size1 = min(kalshi_yes_ask_size, poly_no_ask_size)
-            if trade_size1 > 0 and (cost1 + (_kalshi_fee(trade_size1, kalshi_yes_ask_price) / trade_size1)) < Decimal("1.0") - PROFITABILITY_BUFFER:
-                kalshi_fees = (_kalshi_fee(trade_size1, kalshi_yes_ask_price) / trade_size1)
-                profit_margin = Decimal("1.0") - (cost1 + kalshi_fees)
-                return ArbitrageOpportunity(
-                    market_id=market_id, buy_yes_platform=Platform.KALSHI, buy_yes_price=kalshi_yes_ask_price,
-                    buy_no_platform=Platform.POLYMARKET, buy_no_price=poly_no_ask_price, profit_margin=profit_margin,
-                    potential_trade_size=trade_size1, kalshi_ticker=market_config["kalshi_ticker"],
-                    polymarket_yes_token_id=market_config["polymarket_yes_token_id"], polymarket_no_token_id=market_config["polymarket_no_token_id"],
-                    kalshi_fees=kalshi_fees
-                )
+            if trade_size1 <= 0:
+                opp1_reason = "zero_trade_size"
+            else:
+                fee_per_contract_1 = _kalshi_fee(trade_size1, kalshi_yes_ask_price) / trade_size1
+                opp1_fee_buffer = fee_per_contract_1 + PROFITABILITY_BUFFER
+                if (cost1 + fee_per_contract_1) < Decimal("1.0") - PROFITABILITY_BUFFER:
+                    profit_margin = Decimal("1.0") - (cost1 + fee_per_contract_1)
+                    returned_opportunity = ArbitrageOpportunity(
+                        market_id=market_id, buy_yes_platform=Platform.KALSHI, buy_yes_price=kalshi_yes_ask_price,
+                        buy_no_platform=Platform.POLYMARKET, buy_no_price=poly_no_ask_price, profit_margin=profit_margin,
+                        potential_trade_size=trade_size1, kalshi_ticker=market_config["kalshi_ticker"],
+                        polymarket_yes_token_id=market_config["polymarket_yes_token_id"], polymarket_no_token_id=market_config["polymarket_no_token_id"],
+                        kalshi_fees=fee_per_contract_1
+                    )
+                    opp1_decision = "trade"
+                    opp1_reason = "profitable"
+                else:
+                    opp1_reason = "sum_above_breakeven"
 
     # --- Opportunity 2: Buy YES on Polymarket, Buy NO on Kalshi ---
-    if poly_yes_ask_price is not None and kalshi_no_ask_price is not None:
+    # NOTE: original logic still runs even if opp1 returned, but only opp1's
+    # return value is published. Keep evaluation parity for the observation log.
+    if poly_yes_ask_price is None or kalshi_no_ask_price is None:
+        opp2_reason = "missing_price"
+    else:
+        opp2_sum = poly_yes_ask_price + kalshi_no_ask_price
         is_stale = False
         if kalshi_outcomes and poly_outcomes:
-            # Kalshi "NO" is derived from "YES" book, so we check the YES book's timestamp
             kalshi_book = kalshi_outcomes.get_book("YES")
             poly_book = poly_outcomes.get_book("YES")
             if kalshi_book and poly_book and (abs(kalshi_book.last_update - poly_book.last_update) > STALENESS_THRESHOLD):
-                 logger.debug("Skipping opportunity 2 check for %s due to stale books.", market_id)
-                 is_stale = True
+                logger.debug("Skipping opportunity 2 check for %s due to stale books.", market_id)
+                is_stale = True
 
-        if not is_stale:
-            cost2 = poly_yes_ask_price + kalshi_no_ask_price
+        if is_stale:
+            opp2_reason = "stale_books"
+        else:
+            cost2 = opp2_sum
             trade_size2 = min(poly_yes_ask_size, kalshi_yes_bid_size)
-            if trade_size2 > 0 and (cost2 + (_kalshi_fee(trade_size2, kalshi_no_ask_price) / trade_size2)) < Decimal("1.0") - PROFITABILITY_BUFFER:
-                kalshi_fees = (_kalshi_fee(trade_size2, kalshi_no_ask_price) / trade_size2)
-                profit_margin = Decimal("1.0") - (cost2 + kalshi_fees)
-                return ArbitrageOpportunity(
-                    market_id=market_id, buy_yes_platform=Platform.POLYMARKET, buy_yes_price=poly_yes_ask_price,
-                    buy_no_platform=Platform.KALSHI, buy_no_price=kalshi_no_ask_price, profit_margin=profit_margin,
-                    potential_trade_size=trade_size2, kalshi_ticker=market_config["kalshi_ticker"],
-                    polymarket_yes_token_id=market_config["polymarket_yes_token_id"], polymarket_no_token_id=market_config["polymarket_no_token_id"],
-                    kalshi_fees= kalshi_fees
-                )
+            if trade_size2 <= 0:
+                opp2_reason = "zero_trade_size"
+            else:
+                fee_per_contract_2 = _kalshi_fee(trade_size2, kalshi_no_ask_price) / trade_size2
+                opp2_fee_buffer = fee_per_contract_2 + PROFITABILITY_BUFFER
+                if (cost2 + fee_per_contract_2) < Decimal("1.0") - PROFITABILITY_BUFFER:
+                    profit_margin = Decimal("1.0") - (cost2 + fee_per_contract_2)
+                    # If opp1 already produced an opportunity, the original code
+                    # returned immediately and never evaluated opp2's trade. Mirror
+                    # that: opp2 only fires if opp1 didn't.
+                    if returned_opportunity is None:
+                        returned_opportunity = ArbitrageOpportunity(
+                            market_id=market_id, buy_yes_platform=Platform.POLYMARKET, buy_yes_price=poly_yes_ask_price,
+                            buy_no_platform=Platform.KALSHI, buy_no_price=kalshi_no_ask_price, profit_margin=profit_margin,
+                            potential_trade_size=trade_size2, kalshi_ticker=market_config["kalshi_ticker"],
+                            polymarket_yes_token_id=market_config["polymarket_yes_token_id"], polymarket_no_token_id=market_config["polymarket_no_token_id"],
+                            kalshi_fees=fee_per_contract_2
+                        )
+                    opp2_decision = "trade"
+                    opp2_reason = "profitable"
+                else:
+                    opp2_reason = "sum_above_breakeven"
 
-    return None
+    # Aggregate decision: "trade" if either opp would fire, else "no_trade".
+    overall_decision = "trade" if (opp1_decision == "trade" or opp2_decision == "trade") else "no_trade"
+
+    # Leg-staleness observation (decision-time book ages). Observation-only —
+    # does NOT change the strategy's STALENESS_THRESHOLD gate above. Reports
+    # both opp1 pair (Kalshi YES vs Poly NO) and opp2 pair (Kalshi YES vs Poly YES).
+    decision_ts = datetime.now(timezone.utc)
+    kalshi_yes_book = kalshi_outcomes.get_book("YES") if kalshi_outcomes else None
+    poly_no_book = poly_outcomes.get_book("NO") if poly_outcomes else None
+    poly_yes_book = poly_outcomes.get_book("YES") if poly_outcomes else None
+
+    def _age_ms(book) -> Optional[int]:
+        if book is None:
+            return None
+        return int((decision_ts - book.last_update).total_seconds() * 1000)
+
+    kalshi_yes_age_ms = _age_ms(kalshi_yes_book)
+    poly_no_age_ms = _age_ms(poly_no_book)
+    poly_yes_age_ms = _age_ms(poly_yes_book)
+
+    def _skew(a, b) -> Optional[int]:
+        return abs(a - b) if (a is not None and b is not None) else None
+
+    opp1_leg_skew_ms = _skew(kalshi_yes_age_ms, poly_no_age_ms)
+    opp2_leg_skew_ms = _skew(kalshi_yes_age_ms, poly_yes_age_ms)
+
+    _write_observation({
+        "ts": decision_ts.isoformat(),
+        "market_pair": market_id,
+        "kalshi_yes_ask_price": kalshi_yes_ask_price,
+        "kalshi_yes_ask_size": kalshi_yes_ask_size,
+        "kalshi_no_ask_price": kalshi_no_ask_price,
+        "kalshi_no_ask_size": kalshi_no_ask_size,
+        "poly_yes_ask_price": poly_yes_ask_price,
+        "poly_yes_ask_size": poly_yes_ask_size,
+        "poly_no_ask_price": poly_no_ask_price,
+        "poly_no_ask_size": poly_no_ask_size,
+        "opp1_sum_kalshi_yes_plus_poly_no": opp1_sum,
+        "opp1_fee_buffer_applied": opp1_fee_buffer,
+        "opp1_decision": opp1_decision,
+        "opp1_reason": opp1_reason,
+        "opp2_sum_poly_yes_plus_kalshi_no": opp2_sum,
+        "opp2_fee_buffer_applied": opp2_fee_buffer,
+        "opp2_decision": opp2_decision,
+        "opp2_reason": opp2_reason,
+        "decision": overall_decision,
+        "profitability_buffer": PROFITABILITY_BUFFER,
+        "breakeven_threshold": Decimal("1.0") - PROFITABILITY_BUFFER,
+        # Leg-staleness (observation-only)
+        "kalshi_age_ms": kalshi_yes_age_ms,
+        "poly_no_age_ms": poly_no_age_ms,
+        "poly_yes_age_ms": poly_yes_age_ms,
+        "opp1_leg_skew_ms": opp1_leg_skew_ms,
+        "opp2_leg_skew_ms": opp2_leg_skew_ms,
+    })
+
+    return returned_opportunity

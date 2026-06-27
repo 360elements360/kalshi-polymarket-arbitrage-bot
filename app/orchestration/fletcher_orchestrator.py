@@ -158,7 +158,11 @@ class FletcherOrchestrator:
                 "id": match.kalshi_ticker,
                 "kalshi_ticker": match.kalshi_ticker,
                 "polymarket_yes_token_id": match.poly_clobTokenIds[0],
-                "polymarket_no_token_id": match.poly_clobTokenIds[1]
+                "polymarket_no_token_id": match.poly_clobTokenIds[1],
+                # Required for routing Polymarket `price_change` frames, which
+                # identify the market by condition_id (hex) rather than by
+                # token_id. The WSS client builds a condition_id_map from this.
+                "polymarket_condition_id": match.poly_conditionId,
             }
             self.markets_config.append(config_item)
             # Register the market with the manager

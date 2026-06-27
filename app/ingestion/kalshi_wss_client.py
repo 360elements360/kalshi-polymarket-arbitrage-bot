@@ -1,8 +1,31 @@
 import asyncio
 import json
 import logging
+import os
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import List, Dict, Optional
+
+# Observation-only raw-frame sink. Mirrors clob_wss._record_frame.
+_FRAME_LOG_PATH = os.environ.get("FRAME_LOG_PATH")
+
+
+def _record_frame(kind: str, msg_type: Optional[str] = None,
+                  market_ticker: Optional[str] = None, note: Optional[str] = None) -> None:
+    if not _FRAME_LOG_PATH:
+        return
+    try:
+        with open(_FRAME_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "venue": "kalshi",
+                "kind": kind,
+                "event_type": msg_type,
+                "asset_id": market_ticker,
+                "note": note,
+            }) + "\n")
+    except Exception:
+        pass
 
 import websockets
 from cryptography.hazmat.primitives.asymmetric import rsa
@@ -57,7 +80,9 @@ class KalshiWebSocketClient(KalshiBaseClient):
         self._lock = asyncio.Lock()
         self._msg_id = 1
         # Internal state required by this adapter to correctly process Kalshi delta messages.
-        self._books_state: Dict[str, Dict[str, Dict[int, int]]] = {}
+        # Kalshi v2 emits prices and sizes as dollar-denominated decimal strings; we
+        # store them as Decimal so signed delta_fp math stays exact.
+        self._books_state: Dict[str, Dict[str, Dict[Decimal, Decimal]]] = {}
         self.logger = logging.getLogger(__name__)
 
     def set_market_config(self, markets_config: List[Dict[str, str]]) -> None:
@@ -133,16 +158,28 @@ class KalshiWebSocketClient(KalshiBaseClient):
         self.logger.info("[Kalshi] Beginning listening process")
         async for raw_message in self._ws:
             self.logger.debug("[Kalshi] Received raw message", extra={'raw_message': raw_message})
+            _record_frame("raw_frame")
             market_ticker = None  # Initialize to handle cases where parsing fails early
             try:
                 data = json.loads(raw_message)
                 msg_type = data.get("type")
+
+                # Control frames (subscription ack, etc.) carry no market_ticker
+                # and aren't book updates. Silently tolerate.
+                if msg_type not in ("orderbook_snapshot", "orderbook_delta"):
+                    self.logger.debug(f"[Kalshi] Ignoring non-book frame: {msg_type}")
+                    _record_frame("non_book_frame", msg_type=msg_type)
+                    continue
+
                 # Extract ticker early for better error logging and handling
                 market_ticker = data.get("msg", {}).get("market_ticker")
 
                 if not market_ticker or market_ticker not in self.market_map:
                     self.logger.debug(f"[Kalshi] Ignoring message for un-tracked or missing ticker: {market_ticker}")
+                    _record_frame("dropped_unknown_ticker", msg_type=msg_type, market_ticker=market_ticker)
                     continue
+
+                _record_frame("accepted_event", msg_type=msg_type, market_ticker=market_ticker)
 
                 # --- Sequence Number Validation ---
                 if not await self._is_sequence_valid(data.get("seq")):
@@ -154,37 +191,75 @@ class KalshiWebSocketClient(KalshiBaseClient):
 
                 if msg_type == "orderbook_snapshot":
                     msg = KalshiSnapshotMessage.model_validate(data).msg
-                    # Reset internal state on snapshot
-                    self._books_state[market_ticker] = {"yes": {}, "no": {}}
-                    for price, size in msg.yes: self._books_state[market_ticker]['yes'][price] = size
-                    for price, size in msg.no: self._books_state[market_ticker]['no'][price] = size
 
-                    bids = [PriceLevelData(price=Decimal(str(p)) / 100, size=Decimal(str(s))) for p, s in msg.yes]
+                    # Fail loud if BOTH sides are absent from the wire — that's
+                    # a contract change, not a quiet market. (An empty list is a
+                    # legitimate "quiet side" and is handled below.)
+                    if msg.yes_dollars_fp is None and msg.no_dollars_fp is None:
+                        raise ValueError(
+                            f"[Kalshi] Snapshot for {market_ticker} has neither "
+                            f"yes_dollars_fp nor no_dollars_fp. Wire format may have changed."
+                        )
+
+                    yes_levels = msg.yes_dollars_fp or []
+                    no_levels = msg.no_dollars_fp or []
+
+                    # Reset internal state on snapshot. Prices are already in
+                    # dollars (str -> Decimal) — NO /100 anywhere.
+                    self._books_state[market_ticker] = {"yes": {}, "no": {}}
+                    for price, size in yes_levels:
+                        self._books_state[market_ticker]['yes'][price] = size
+                    for price, size in no_levels:
+                        self._books_state[market_ticker]['no'][price] = size
+
+                    bids = [PriceLevelData(price=p, size=s) for p, s in yes_levels]
                     asks = [
-                        PriceLevelData(price=Decimal("1") - (Decimal(str(p)) / Decimal("100")), size=Decimal(str(s)))
-                        for p, s in msg.no]
+                        PriceLevelData(price=Decimal(1) - p, size=s)
+                        for p, s in no_levels
+                    ]
                     event = OrderBookSnapshotReceived(
-                        platform=Platform.KALSHI, market_id=common_market_id, outcome="YES", bids=bids, asks=asks
+                        platform=Platform.KALSHI, market_id=common_market_id, outcome="YES",
+                        bids=bids, asks=asks
                     )
-                elif msg_type == "orderbook_delta":
+                else:  # orderbook_delta
                     msg = KalshiDeltaMessage.model_validate(data).msg
-                    current_size = self._books_state[market_ticker][msg.side].get(msg.price, 0)
-                    new_size = current_size + msg.delta
-                    self._books_state[market_ticker][msg.side][msg.price] = new_size
+
+                    # Defensive: a delta may target a ticker we haven't yet
+                    # received a snapshot for (out-of-order delivery). Initialize.
+                    book_side = self._books_state.setdefault(
+                        market_ticker, {"yes": {}, "no": {}}
+                    ).setdefault(msg.side, {})
+
+                    current_size = book_side.get(msg.price_dollars, Decimal(0))
+                    new_size = current_size + msg.delta_fp
+
                     if new_size < 0:
-                        self.logger.error(f"[Kalshi] Negative size calculated for {market_ticker}: {new_size}")
+                        self.logger.error(
+                            f"[Kalshi] Negative size at {msg.side} {msg.price_dollars} "
+                            f"for {market_ticker}: {current_size} + {msg.delta_fp} = {new_size}. "
+                            "Requesting resubscribe."
+                        )
+                        await self._request_resubscribe(market_ticker)
                         continue
 
-                    price_decimal = Decimal(msg.price) / 100
+                    if new_size == 0:
+                        book_side.pop(msg.price_dollars, None)
+                    else:
+                        book_side[msg.price_dollars] = new_size
+
+                    # Translate Kalshi yes/no into the normalized YES book:
+                    #  - yes-side liquidity is a BUY at price_dollars
+                    #  - no-side liquidity at p is equivalent to a SELL of YES at (1 - p)
                     if msg.side == 'yes':
                         side = SIDES.BUY
+                        price_decimal = msg.price_dollars
                     else:
                         side = SIDES.SELL
-                        price_decimal = Decimal(1) - price_decimal
+                        price_decimal = Decimal(1) - msg.price_dollars
 
                     event = OrderBookDeltaReceived(
                         platform=Platform.KALSHI, market_id=common_market_id, outcome="YES",
-                        side=side, price=price_decimal, size=Decimal(new_size)
+                        side=side, price=price_decimal, size=new_size
                     )
 
                 if event:

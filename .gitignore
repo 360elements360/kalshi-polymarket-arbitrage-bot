@@ -12,3 +12,4 @@ logs/
 .env.*
 private-keys/
 .DS_Store
+HANDOFF.md
