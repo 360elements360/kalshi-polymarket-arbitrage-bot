@@ -26,7 +26,10 @@ class ArbitrageOpportunity(BaseModel):
     polymarket_yes_token_id: str
     polymarket_no_token_id: str
     # --- Trade calculation data
+    # Per-contract fees, separated by platform. Both legs are takers, so total
+    # cost = price_sum + kalshi_fees + polymarket_fees.
     kalshi_fees: Optional[Money] = None
+    polymarket_fees: Optional[Money] = None
 
 
 class ArbitrageOpportunityRecord(BaseModel):

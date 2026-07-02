@@ -116,13 +116,69 @@ async def handle_trade_attempt_completed(event: TradeAttemptCompleted):
 # --- Strategy Logic ---
 
 def _kalshi_fee(contracts: Money, price: Money, rate: Decimal = Decimal("0.07")) -> Money:
-    """Calculates the Kalshi trading fee."""
+    """Calculates the Kalshi trading fee.
+
+    Official schedule: ceil_cent(rate * C * P * (1-P)). Kalshi rounds the fee UP
+    to the next whole cent. Default rate is the standard taker rate (0.07);
+    pass 0.035 for S&P 500/Nasdaq-100 markets or 0.0175 for maker-fee markets.
+    Ref: https://kalshi.com/docs/kalshi-fee-schedule.pdf
+    """
     if price <= Decimal("0") or price >= Decimal("1"):
         return Money("0.00")
     raw_decimal = rate * contracts * price * (Decimal("1") - price)
     cents = raw_decimal * Decimal("100")
     rounded_cents = cents.to_integral_value(rounding=ROUND_CEILING)
     return rounded_cents / Decimal("100")
+
+
+# Polymarket taker fee rates by market category. Takers pay C * rate * P * (1-P)
+# with NO rounding to the cent (unlike Kalshi). Makers are not charged.
+# Ref: https://docs.polymarket.com/trading/fees
+POLYMARKET_FEE_RATES: Dict[str, Decimal] = {
+    "crypto": Decimal("0.07"),
+    "sports": Decimal("0.03"),
+    "finance": Decimal("0.04"),
+    "politics": Decimal("0.04"),
+    "mentions": Decimal("0.04"),
+    "tech": Decimal("0.04"),
+    "econ": Decimal("0.05"),
+    "culture": Decimal("0.05"),
+    "weather": Decimal("0.05"),
+    "other": Decimal("0.05"),
+    "geopolitics": Decimal("0"),
+    "world": Decimal("0"),
+}
+# Conservative fallback when a market's Polymarket fee tier is not configured:
+# assume the highest (crypto) tier so we never UNDER-count fees and trade an
+# edge that is actually unprofitable. Override via POLYMARKET_FEE_RATE_DEFAULT.
+DEFAULT_POLYMARKET_FEE_RATE = Decimal(os.environ.get("POLYMARKET_FEE_RATE_DEFAULT", "0.07"))
+
+
+def _polymarket_fee_rate(market_config: Dict[str, str]) -> Decimal:
+    """Resolves the Polymarket taker fee rate for a market.
+
+    Precedence: explicit per-market `polymarket_fee_rate` > `polymarket_category`
+    lookup > conservative default. This keeps the rate fully configurable per
+    pair while still defaulting safely for markets with no fee tier set.
+    """
+    raw_rate = market_config.get("polymarket_fee_rate")
+    if raw_rate is not None and str(raw_rate) != "":
+        return Decimal(str(raw_rate))
+    category = (market_config.get("polymarket_category") or "").strip().lower()
+    if category in POLYMARKET_FEE_RATES:
+        return POLYMARKET_FEE_RATES[category]
+    return DEFAULT_POLYMARKET_FEE_RATE
+
+
+def _polymarket_fee(contracts: Money, price: Money, rate: Decimal) -> Money:
+    """Calculates the Polymarket taker trading fee.
+
+    Official formula: C * rate * P * (1-P), with NO rounding to the cent.
+    Ref: https://docs.polymarket.com/trading/fees
+    """
+    if rate <= Decimal("0") or price <= Decimal("0") or price >= Decimal("1"):
+        return Money("0.00")
+    return rate * contracts * price * (Decimal("1") - price)
 
 
 def _check_for_buy_both_arb(market_state: MarketState) -> Optional[ArbitrageOpportunity]:
@@ -134,6 +190,9 @@ def _check_for_buy_both_arb(market_state: MarketState) -> Optional[ArbitrageOppo
     market_config = _market_config_map.get(market_id)
     if not market_config:
         return None
+
+    # Polymarket taker fee rate for this pair (configurable per market).
+    poly_fee_rate = _polymarket_fee_rate(market_config)
 
     # --- Get prices by asking the domain model ---
     kalshi_yes_ask_price = market_state.get_price(Platform.KALSHI, "YES", SIDES.SELL)
@@ -202,7 +261,12 @@ def _check_for_buy_both_arb(market_state: MarketState) -> Optional[ArbitrageOppo
             if trade_size1 <= 0:
                 opp1_reason = "zero_trade_size"
             else:
-                fee_per_contract_1 = _kalshi_fee(trade_size1, kalshi_yes_ask_price) / trade_size1
+                # opp1 = buy YES on Kalshi (fee on Kalshi YES) + buy NO on
+                # Polymarket (taker fee on the Poly NO leg). Both legs are takers,
+                # so total cost must include BOTH platforms' fees.
+                kalshi_fee_pc_1 = _kalshi_fee(trade_size1, kalshi_yes_ask_price) / trade_size1
+                poly_fee_pc_1 = _polymarket_fee(trade_size1, poly_no_ask_price, poly_fee_rate) / trade_size1
+                fee_per_contract_1 = kalshi_fee_pc_1 + poly_fee_pc_1
                 opp1_fee_buffer = fee_per_contract_1 + PROFITABILITY_BUFFER
                 if (cost1 + fee_per_contract_1) < Decimal("1.0") - PROFITABILITY_BUFFER:
                     profit_margin = Decimal("1.0") - (cost1 + fee_per_contract_1)
@@ -211,7 +275,7 @@ def _check_for_buy_both_arb(market_state: MarketState) -> Optional[ArbitrageOppo
                         buy_no_platform=Platform.POLYMARKET, buy_no_price=poly_no_ask_price, profit_margin=profit_margin,
                         potential_trade_size=trade_size1, kalshi_ticker=market_config["kalshi_ticker"],
                         polymarket_yes_token_id=market_config["polymarket_yes_token_id"], polymarket_no_token_id=market_config["polymarket_no_token_id"],
-                        kalshi_fees=fee_per_contract_1
+                        kalshi_fees=kalshi_fee_pc_1, polymarket_fees=poly_fee_pc_1
                     )
                     opp1_decision = "trade"
                     opp1_reason = "profitable"
@@ -241,7 +305,11 @@ def _check_for_buy_both_arb(market_state: MarketState) -> Optional[ArbitrageOppo
             if trade_size2 <= 0:
                 opp2_reason = "zero_trade_size"
             else:
-                fee_per_contract_2 = _kalshi_fee(trade_size2, kalshi_no_ask_price) / trade_size2
+                # opp2 = buy NO on Kalshi (fee on derived Kalshi NO) + buy YES on
+                # Polymarket (taker fee on the Poly YES leg). Include both fees.
+                kalshi_fee_pc_2 = _kalshi_fee(trade_size2, kalshi_no_ask_price) / trade_size2
+                poly_fee_pc_2 = _polymarket_fee(trade_size2, poly_yes_ask_price, poly_fee_rate) / trade_size2
+                fee_per_contract_2 = kalshi_fee_pc_2 + poly_fee_pc_2
                 opp2_fee_buffer = fee_per_contract_2 + PROFITABILITY_BUFFER
                 if (cost2 + fee_per_contract_2) < Decimal("1.0") - PROFITABILITY_BUFFER:
                     profit_margin = Decimal("1.0") - (cost2 + fee_per_contract_2)
@@ -254,7 +322,7 @@ def _check_for_buy_both_arb(market_state: MarketState) -> Optional[ArbitrageOppo
                             buy_no_platform=Platform.KALSHI, buy_no_price=kalshi_no_ask_price, profit_margin=profit_margin,
                             potential_trade_size=trade_size2, kalshi_ticker=market_config["kalshi_ticker"],
                             polymarket_yes_token_id=market_config["polymarket_yes_token_id"], polymarket_no_token_id=market_config["polymarket_no_token_id"],
-                            kalshi_fees=fee_per_contract_2
+                            kalshi_fees=kalshi_fee_pc_2, polymarket_fees=poly_fee_pc_2
                         )
                     opp2_decision = "trade"
                     opp2_reason = "profitable"
@@ -307,6 +375,7 @@ def _check_for_buy_both_arb(market_state: MarketState) -> Optional[ArbitrageOppo
         "opp2_decision": opp2_decision,
         "opp2_reason": opp2_reason,
         "decision": overall_decision,
+        "polymarket_fee_rate": poly_fee_rate,
         "profitability_buffer": PROFITABILITY_BUFFER,
         "breakeven_threshold": Decimal("1.0") - PROFITABILITY_BUFFER,
         # Leg-staleness (observation-only)

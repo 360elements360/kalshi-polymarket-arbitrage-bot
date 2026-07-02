@@ -337,6 +337,130 @@ class TestArbitrageMonitor(unittest.IsolatedAsyncioTestCase):
 
         self.bus.publish.assert_not_called()
 
+    # --------------------------------------------------------------------------
+    # Polymarket Fee Tests
+    # --------------------------------------------------------------------------
+
+    def _set_polymarket_category(self, category: str):
+        """Re-initialize the monitor with a Polymarket fee tier on the market."""
+        config = dict(self.markets_config[0])
+        config["polymarket_category"] = category
+        arbitrage_monitor.initialize_arbitrage_handlers(
+            market_manager=self.market_manager, bus=self.bus, markets_config=[config]
+        )
+
+    def test_polymarket_fee_formula_has_no_cent_rounding(self):
+        """Poly fee is C * rate * P * (1-P) with NO ceil-to-cent (unlike Kalshi).
+
+        100 @ 0.50 crypto -> exactly $1.75. 10 @ 0.50 -> 0.175, which Kalshi
+        would round UP to 0.18 but Polymarket leaves un-rounded.
+        """
+        self.assertEqual(
+            arbitrage_monitor._polymarket_fee(Decimal("100"), Decimal("0.50"), Decimal("0.07")),
+            Decimal("1.75"),
+        )
+        self.assertEqual(
+            arbitrage_monitor._polymarket_fee(Decimal("10"), Decimal("0.50"), Decimal("0.07")),
+            Decimal("0.175"),
+        )
+        # Sports tier (0.03): 100 @ 0.50 -> 0.75.
+        self.assertEqual(
+            arbitrage_monitor._polymarket_fee(Decimal("100"), Decimal("0.50"), Decimal("0.03")),
+            Decimal("0.75"),
+        )
+
+    def test_polymarket_fee_zero_at_zero_rate_and_boundaries(self):
+        """Zero rate (geopolitics) or price at 0/1 yields no fee."""
+        self.assertEqual(
+            arbitrage_monitor._polymarket_fee(Decimal("100"), Decimal("0.50"), Decimal("0")),
+            Decimal("0.00"),
+        )
+        self.assertEqual(
+            arbitrage_monitor._polymarket_fee(Decimal("100"), Decimal("0"), Decimal("0.07")),
+            Decimal("0.00"),
+        )
+        self.assertEqual(
+            arbitrage_monitor._polymarket_fee(Decimal("100"), Decimal("1"), Decimal("0.07")),
+            Decimal("0.00"),
+        )
+
+    def test_polymarket_fee_rate_resolution_precedence(self):
+        """Explicit per-market rate > category lookup > conservative default."""
+        # Explicit rate wins over category.
+        self.assertEqual(
+            arbitrage_monitor._polymarket_fee_rate(
+                {"polymarket_fee_rate": "0.02", "polymarket_category": "crypto"}
+            ),
+            Decimal("0.02"),
+        )
+        # Category lookup (case-insensitive).
+        self.assertEqual(
+            arbitrage_monitor._polymarket_fee_rate({"polymarket_category": "Sports"}),
+            Decimal("0.03"),
+        )
+        self.assertEqual(
+            arbitrage_monitor._polymarket_fee_rate({"polymarket_category": "geopolitics"}),
+            Decimal("0"),
+        )
+        # Unknown/absent -> conservative default (crypto tier).
+        self.assertEqual(
+            arbitrage_monitor._polymarket_fee_rate({}),
+            arbitrage_monitor.DEFAULT_POLYMARKET_FEE_RATE,
+        )
+
+    async def test_polymarket_fee_flips_marginal_opportunity_to_no_trade(self):
+        """A crossing that survives Kalshi fees alone must be rejected once the
+        Polymarket taker fee is also charged.
+
+        cost = 0.48 + 0.48 = 0.96, size 10, crypto tier.
+          Kalshi fee/contract ~= 0.018  -> 0.978  (< 0.99, would trade)
+          + Poly fee/contract ~= 0.0175 -> ~0.995 (>= 0.99, must reject)
+        """
+        self._set_polymarket_category("crypto")
+        self._create_market_state(
+            kalshi_yes_ask_price=Decimal("0.48"), kalshi_yes_ask_size=Decimal("10"),
+            poly_no_ask_price=Decimal("0.48"), poly_no_ask_size=Decimal("10"),
+        )
+        event = MarketBookUpdated(market_id=self.market_id, platform=Platform.KALSHI)
+        await arbitrage_monitor.handle_market_book_update(event)
+
+        self.bus.publish.assert_not_called()
+
+    async def test_fee_free_polymarket_tier_keeps_marginal_opportunity(self):
+        """The SAME prices that fail under crypto fees should pass when the
+        Polymarket tier is fee-free (geopolitics) — proving the rejection above
+        is driven by the Poly fee, not the prices."""
+        self._set_polymarket_category("geopolitics")
+        self._create_market_state(
+            kalshi_yes_ask_price=Decimal("0.48"), kalshi_yes_ask_size=Decimal("10"),
+            poly_no_ask_price=Decimal("0.48"), poly_no_ask_size=Decimal("10"),
+        )
+        event = MarketBookUpdated(market_id=self.market_id, platform=Platform.KALSHI)
+        await arbitrage_monitor.handle_market_book_update(event)
+
+        self.bus.publish.assert_called_once()
+        opportunity = self.bus.publish.call_args[0][0].opportunity
+        self.assertEqual(opportunity.polymarket_fees, Decimal("0.00"))
+
+    async def test_opportunity_carries_separated_platform_fees(self):
+        """A profitable opportunity records per-contract Kalshi and Polymarket
+        fees separately, both non-zero on a crypto-tier market."""
+        self._set_polymarket_category("crypto")
+        self._create_market_state(
+            kalshi_yes_ask_price=Decimal("0.40"), kalshi_yes_ask_size=Decimal("10"),
+            poly_no_ask_price=Decimal("0.35"), poly_no_ask_size=Decimal("10"),
+        )
+        event = MarketBookUpdated(market_id=self.market_id, platform=Platform.KALSHI)
+        await arbitrage_monitor.handle_market_book_update(event)
+
+        self.bus.publish.assert_called_once()
+        opportunity = self.bus.publish.call_args[0][0].opportunity
+        # Poly NO leg @ 0.35, size 10, rate 0.07: 0.07*10*0.35*0.65 = 0.15925,
+        # per contract 0.015925 (no cent rounding).
+        self.assertEqual(opportunity.polymarket_fees, Decimal("0.015925"))
+        self.assertIsNotNone(opportunity.kalshi_fees)
+        self.assertGreater(opportunity.kalshi_fees, Decimal("0"))
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -163,6 +163,12 @@ class FletcherOrchestrator:
                 # identify the market by condition_id (hex) rather than by
                 # token_id. The WSS client builds a condition_id_map from this.
                 "polymarket_condition_id": match.poly_conditionId,
+                # Polymarket taker fee tier for this pair. Drives the fee the
+                # strategy charges the Poly leg (see arbitrage_monitor
+                # POLYMARKET_FEE_RATES). Left as configured on the pair if
+                # present; otherwise the strategy falls back to a safe default.
+                "polymarket_category": getattr(match, "poly_category", None),
+                "polymarket_fee_rate": getattr(match, "poly_fee_rate", None),
             }
             self.markets_config.append(config_item)
             # Register the market with the manager
