@@ -12,6 +12,8 @@ from app.domain.types import TradeDetails
 from app.gateways.trade_gateway import TradeGateway
 from app.message_bus import MessageBus
 from app.services.operational.balance_service import BalanceService
+from app.services import risk
+from shared_wallets.domain.types import Currency
 from app.strategies.trade_prct_size import get_trade_size
 
 # --- Module Setup ---
@@ -43,6 +45,7 @@ def initialize_trade_executor(
     _balance_service = balance_service
     _max_trade_size = max_trade_size
     _shutdown_event = shutdown_event
+    risk.set_shutdown_event(shutdown_event)
     if _dry_run:
         logger.warning("TradeExecutor is in DRY RUN mode. No real orders will be placed.")
     logger.info("Trade executor handlers initialized.")
@@ -73,6 +76,18 @@ async def handle_execute_trade(command: ExecuteTrade):
         await _bus.publish(TradeAttemptCompleted())
         return
 
+    try:
+        balances = (_balance_service.kalshi_wallet.get_balance(Currency.USD).amount,
+                    _balance_service.polymarket_wallet.get_balance(Currency.USDC_E).amount)
+    except Exception as e:
+        logger.warning(f"Risk: could not read live balances: {e}")
+        balances = None
+    reason = risk.check(opportunity, trade_size, balances)
+    if reason:
+        logger.warning(f"{log_prefix}Risk check refused trade on {opportunity.market_id}: {reason}")
+        await _bus.publish(TradeAttemptCompleted())  # unlock the monitor; no trade was attempted
+        return
+
     logger.info(
         f"{log_prefix}Executing arbitrage",
         extra={
@@ -90,6 +105,7 @@ async def handle_execute_trade(command: ExecuteTrade):
         kalshi_task = _execute_kalshi_buy_no(opportunity, trade_size)
         polymarket_task = _execute_polymarket_buy_yes(opportunity, trade_size)
 
+    risk.record_sent(opportunity, trade_size)
     kalshi_result, polymarket_result = await asyncio.gather(kalshi_task, polymarket_task, return_exceptions=True)
 
     # Publish arbitrage trade results to the bus
@@ -186,6 +202,7 @@ async def handle_trade_response(kalshi_result, polymarket_result, trade_type : s
     # Scenario: Both legs failed. Trigger application shutdown.
     if is_kalshi_error and is_polymarket_error:
         logger.critical("Both trade legs failed. Triggering application shutdown.")
+        risk.record_leg_failure()
         _shutdown_event.set()
         return  # Stop further processing
 
@@ -198,6 +215,7 @@ async def handle_trade_response(kalshi_result, polymarket_result, trade_type : s
             order_id=polymarket_result.id,
             polymarket_token_id=polymarket_result.token_id
         )
+        risk.record_leg_failure()
         event = TradeFailed(
             failed_leg_platform=Platform.KALSHI,
             successful_leg=successful_leg,
@@ -215,6 +233,7 @@ async def handle_trade_response(kalshi_result, polymarket_result, trade_type : s
             kalshi_ticker=kalshi_result.ticker,
             kalshi_side=kalshi_result.side
         )
+        risk.record_leg_failure()
         event = TradeFailed(
             failed_leg_platform=Platform.POLYMARKET,
             successful_leg=successful_leg,
@@ -235,6 +254,7 @@ async def handle_trade_response(kalshi_result, polymarket_result, trade_type : s
     # If both legs succeeded, publish the event to trigger the application reset
     if not is_kalshi_error and not is_polymarket_error:
         logger.info("Both trade legs succeeded. Publishing ArbitrageTradeSuccessful event.")
+        risk.record_leg_success()
         await _bus.publish(ArbitrageTradeSuccessful())
         await _bus.publish(TradeAttemptCompleted())
 

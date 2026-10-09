@@ -35,6 +35,19 @@ class Settings(BaseSettings):
     SHUTDOWN_BALANCE: Decimal = 10.00
     MINIMUM_WALLET_BALANCE: Decimal = Field(..., description="Minimum wallet balance required")
 
+    # Risk kill switch (see app/services/risk.py)
+    RISK_MAX_NOTIONAL_PER_TRADE: float = 10.00
+    RISK_MAX_OPEN_EXPOSURE: float = 60.00
+    RISK_MAX_TRADES_PER_HOUR: int = 3
+    RISK_MAX_TRADES_PER_DAY: int = 10
+    RISK_MIN_EDGE_PER_CONTRACT: float = 0.005
+    RISK_MAX_EDGE_PER_CONTRACT: float = 0.15
+    RISK_MAX_REALIZED_LOSS: float = 15.00
+    RISK_MAX_CONSECUTIVE_LEG_FAILURES: int = 2
+    RISK_BALANCE_FLOOR_DROP: float = 25.00
+    RISK_HALT_FILE: str = "risk.HALT"
+    NTFY_TOPIC: str = ""
+
     # API & Execution Configuration
     ENABLE_API: bool = True
     # Format: '[["POLY_ID_1", "KALSHI_TICKER_1"], ["POLY_ID_2", "KALSHI_TICKER_2"]]'

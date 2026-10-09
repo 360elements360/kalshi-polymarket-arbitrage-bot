@@ -86,6 +86,11 @@ Create a `.env` file in the root directory. Below is the complete list of suppor
 | `MIN_PROFIT_THRESHOLD` | Minimum profit margin required to execute a trade (0.00 - 1.00). | `0.00` |
 | `SHUTDOWN_BALANCE` | If wallet balances drop below this amount ($), the bot will shutdown. | `10.00` |
 | `MINIMUM_WALLET_BALANCE` | The target minimum balance required to operate. Used for calculating "Max Spend". | `100.00` |
+| `RISK_MAX_NOTIONAL_PER_TRADE` / `RISK_MAX_OPEN_EXPOSURE` | Kill switch: max $ per leg, and max $ cost of unresolved trades (both legs). | `10.00` / `60.00` |
+| `RISK_MAX_TRADES_PER_HOUR` / `RISK_MAX_TRADES_PER_DAY` | Kill switch: trade count caps. | `3` / `10` |
+| `RISK_MIN_EDGE_PER_CONTRACT` / `RISK_MAX_EDGE_PER_CONTRACT` | Edge band ($/contract); outside it the match is treated as bad, not an arb. | `0.005` / `0.15` |
+| `RISK_MAX_REALIZED_LOSS` / `RISK_MAX_CONSECUTIVE_LEG_FAILURES` / `RISK_BALANCE_FLOOR_DROP` | Halt on cumulative realized loss ($), consecutive leg failures, or a venue balance ($) falling this far below its startup value. | `15.00` / `2` / `25.00` |
+| `RISK_HALT_FILE` / `NTFY_TOPIC` | Halt file path (repo-relative). While it exists no trade is placed; **to un-halt, delete the file** (delete `risk_state.json` beside it to also reset counters). If `NTFY_TOPIC` is set, halts are POSTed to ntfy.sh. | `risk.HALT` / empty |
 
 ## Setup and Installation
 
